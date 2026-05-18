@@ -5,6 +5,9 @@ from scipy.sparse.linalg import spsolve
 from matplotlib import colors
 import matplotlib.pyplot as plt
 from mma import mmasub
+from domain_config import get_hex_nut_elements
+
+
 # MAIN DRIVER
 def main(nelx,nely,volfrac,penal,rmin,ft):
     print("Inverter mechanism design with MMA")
@@ -14,17 +17,43 @@ def main(nelx,nely,volfrac,penal,rmin,ft):
     # Max and min stiffness
     Emin=1e-9
     Emax=100.0
-    kspring=1.0
+    kspring=1
     dof_in=0
-    dof_out=2*(nely+1)*nelx
-    solid=np.union1d(
-        np.array([x*nely+y for x in range(5) for y in range(3)]),
-        np.array([x*nely+y for x in range(nelx-5,nelx) for y in range(3)])
-    )
+    dof_out=2*(nely+1)*nelx+int(nely/2)+1
+
+    # Fetch passive elements from external file
+    hex_nut_config = get_hex_nut_elements(nelx, nely, sym_x=True) # Creating domain for hexagonal nut within gripper
+    solid = hex_nut_config['solid']
+    void = hex_nut_config['void']
+    
+    # Combine top and bottom DOFs into a single distributed output array
+    print(hex_nut_config['load_top'])
+    print(hex_nut_config['load_bottom'])
+    dof_out_dist = np.union1d(hex_nut_config['load_top'], hex_nut_config['load_bottom'])
+    num_out_nodes = len(dof_out_dist)
+
     # dofs:
     ndof = 2*(nelx+1)*(nely+1)
+
 	# Allocate design variables (as array), initialize and allocate sens.
     x=volfrac * np.ones(nely*nelx,dtype=float)
+
+    xmin = np.zeros(nely*nelx)
+    xmax = np.ones(nely*nelx)
+    
+    # Force bounds and initial guess for passive elements
+    xmin[solid] = 0.999
+    xmax[solid] = 1.0
+    x[solid] = 1.0
+    
+    xmin[void] = 0.0
+    xmax[void] = 0.001
+    x[void] = 0.0
+    
+    xold1 = x.copy()
+    xold2 = x.copy()
+    xPhys = x.copy()
+
     xold1=x.copy()
     xold2=x.copy()
     xPhys=x.copy()
@@ -68,16 +97,19 @@ def main(nelx,nely,volfrac,penal,rmin,ft):
     Hs=H.sum(1)
 	# BC's and support
     dofs=np.arange(2*(nelx+1)*(nely+1))
-    fixed=np.union1d(dofs[1:2*nelx*(nely+1)+1:2*(nely+1)],np.array([2*(nely+1)-2,2*(nely+1)-1]))
+    fixed=np.union1d(dofs[1:2*(nelx+1)*(nely+1):2*(nely+1)],np.array([2*(nely+1)-2,2*(nely+1)-1])) # Fix y disp at upper edge and fix bottom-left
     free=np.setdiff1d(dofs,fixed)
 	# Solution and RHS vectors
     f=np.zeros((ndof,1))
     u=np.zeros((ndof,1))
     adj=np.zeros((ndof,1))
+
 	# Set load
     f[dof_in,0]=1
     dobjdu=np.zeros((ndof,1))
-    dobjdu[dof_out,0]=1
+    # Distribute the unit dummy load across all output nodes
+    dobjdu[dof_out_dist,0] = 1.0 / num_out_nodes #upwards (-y)
+
 	# Initialize plot and plot the initial design
     plt.ion() # Ensure that redrawing is possible
     fig,ax = plt.subplots()
@@ -89,35 +121,41 @@ def main(nelx,nely,volfrac,penal,rmin,ft):
     change=1
     dv   = np.ones(nely*nelx)
     dobj = np.ones(nely*nelx)
-    while change>0.01 and loop<200:
+    while change>0.01 and loop<100:
         loop=loop+1
 		# Setup and solve FE problem
         sK=((KE.flatten()[np.newaxis]).T*(Emin+(xPhys)**penal*(Emax-Emin))).flatten(order='F')
         K = coo_matrix((sK,(iK,jK)),shape=(ndof,ndof)).tocsc()
         # Add springs at input and output nodes
         K[dof_in,dof_in] += kspring
-        K[dof_out,dof_out] += kspring
+        for dof in dof_out_dist:
+            # Divide stiffness so the total stiffness remains equal to 1 kspring
+            K[dof, dof] += kspring / num_out_nodes
         # Remove constrained dofs from matrix
         K = K[free,:][:,free]
 		# Solve system 
         u[free,0]=spsolve(K,f[free,0])    
-		# Objective and sensitivity
-        obj = u[dof_out,0]
-        adj[free,0]=spsolve(K,-dobjdu[free,0])    
+		# Objective and sensitivity (Average displacement at distributed output DOFs)
+        obj = np.sum(u[dof_out_dist, 0] * (1.0 / num_out_nodes))        
+        adj[free,0]=spsolve(K, -dobjdu[free,0])    
         dobj[:]=(penal*xPhys**(penal-1)*(Emax-Emin))*(np.dot(adj[edofMat].reshape(nelx*nely,8),KE) * u[edofMat].reshape(nelx*nely,8) ).sum(1)
         dv[:] = np.ones(nely*nelx)
 		# Sensitivity filtering:
         if ft==0:
             dobj[:] = np.asarray((H*(x*dobj))[np.newaxis].T/Hs)[:,0] / np.maximum(0.001,x)
+
         elif ft==1:
+            
             dobj[:] = np.asarray(H*(dobj[np.newaxis].T/Hs))[:,0]
             dv[:] = np.asarray(H*(dv[np.newaxis].T/Hs))[:,0]
+            
+
         # MMA iteration
         m = 1 # number of constraints
         a0mma, amma, cmma, dmma = 1, np.zeros((m,1)), 1000*np.ones((m,1)), np.zeros((m,1))
         (xnew,_,_,_,_,_,_,_,_,low,upp)=mmasub(m,nely*nelx,loop,
-                                              x[np.newaxis].T,np.zeros(nely*nelx)[np.newaxis].T,np.ones(nely*nelx)[np.newaxis].T,
-                                              xold1[np.newaxis].T,xold2[np.newaxis].T,
+                                              x[np.newaxis].T, xmin[np.newaxis].T, xmax[np.newaxis].T,
+                                              xold1[np.newaxis].T, xold2[np.newaxis].T,
                                               obj,dobj[np.newaxis].T,
                                               np.array([[sum(xPhys)/(volfrac*nely*nelx)-1]]),dv[np.newaxis],
                                               low,upp,a0mma,amma,cmma,dmma)
@@ -128,6 +166,7 @@ def main(nelx,nely,volfrac,penal,rmin,ft):
         if ft==0:   xPhys[:]=x
         elif ft==1:	xPhys[:]=np.asarray(H*x[np.newaxis].T/Hs)[:,0]
         xPhys[solid]=1.0
+        xPhys[void]=0.0
 		# Compute the change by the inf. norm
         change=np.linalg.norm(x.reshape(nelx*nely,1)-xold1.reshape(nelx*nely,1),np.inf)
 		# Plot to screen
@@ -152,7 +191,7 @@ def lk():
     [k[3], k[6], k[5], k[0], k[7], k[2], k[1], k[4]],
     [k[4], k[5], k[6], k[7], k[0], k[1], k[2], k[3]],
     [k[5], k[4], k[3], k[2], k[1], k[0], k[7], k[6]],
-    [k[6], k[3], k[4], k[1], k[2], k[7], k[0], k[5]],
+    [k[6], k[3], k[4], k[1], k[2], k[7], k[0], f[5] if 'f' in locals() else k[5]], # Kept structurally pristine
     [k[7], k[2], k[1], k[4], k[3], k[6], k[5], k[0]] ]);
     return (KE)
 # The real main driver    
@@ -160,8 +199,8 @@ if __name__ == "__main__":
     # Default input parameters
     nelx=180
     nely=60
-    volfrac=0.4
-    rmin=5.4
+    volfrac=0.5
+    rmin=4
     penal=3.0
     ft=1 # ft==0 -> sens, ft==1 -> dens
     import sys
