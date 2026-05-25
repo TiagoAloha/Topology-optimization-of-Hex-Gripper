@@ -11,7 +11,7 @@ def get_hex_nut_elements(nelx, nely, sym_x=False):
     xc =  int(7 * nelx / 8) 
     yc = 0 if sym_x else int(nely / 2) #symmetrical in y direction (around x-axis)      
     
-    R_hex_in = nely / 8 # Inner radius of the hexagon (distance from center to a vertex)
+    R_hex_in = int(nelx / 8) # Inner radius of the hexagon (distance from center to a vertex)
     R_out = R_hex_in + 2 # A small sliver of material around hex to grip the nut               
              
 
@@ -49,19 +49,20 @@ def get_hex_nut_elements(nelx, nely, sym_x=False):
     # ---------------------------------------------
 
     # Define final passive solid domains (manual addition of solids and voids)
-    solid = reduce(np.union1d, (
+    solid = reduce(np.union1d, 
+        (
         np.array([x*nely+y for x in range(5) for y in range(3)], dtype=int), # Load point 
-        # np.array([x*nely+y for x in range(int(3*nelx/4), nelx) for y in range(int(nely/2), int(nely/2)+3)], dtype=int), 
-        # np.array([x*nely+y for x in range(int(3*nelx/4)-5, int(3*nelx/4)) for y in range(3)], dtype=int),
-        nut_solid 
-    ))
+        # np.array([x*nely+y for x in range(xc - R_hex_in - 6, xc - R_hex_in) for y in range(yc, yc + 2)], dtype=int), # Left-side connection of spanner
+        nut_solid
+        )
+    )
     
     void = reduce(np.union1d, (
         np.array([], dtype=int),
         nut_void 
     ))
     
-    # --- DISTRIBUTED LOAD DOFS CALCULATION ---
+    # --- DISTRIBUTED LOAD DOFS CALCULATION 
     # Identify the horizontal node span over the nut area
     x_nodes = np.arange(xc, xc + int(R_out / 2) + 1)
     
